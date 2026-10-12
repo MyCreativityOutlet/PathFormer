@@ -1,0 +1,29 @@
+[project]
+name = "pathformer"
+version = "0.1.0"
+requires-python = ">=3.12"
+readme = "README.md"
+authors = [
+    {name = "Liam Brydon-Brown", email = "liam.brydon@auckland.ac.nz"}
+]
+dependencies = [
+    "pytorch-lightning==2.6.6",
+    "lightning==2.6.6",
+    "joblib>=1.5.1",
+    "torch==2.13.0",
+    "rdkit>=2025.9.3",
+    "seaborn>=0.13.2",
+    "orjson>=3.13.0",
+    "scikit-learn>=1.8.0",
+    "envipath-python"
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cuda"}
+]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
