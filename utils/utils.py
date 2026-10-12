@@ -638,7 +638,7 @@ def pathway_graph_to_seq_bfs(graph, *args, **kwargs):
             spectra_data = [
                 (min(mz / 800.0, 1.0), intensity, int(energy[-1]) / len(energy_keys))
                 for energy, level in spectra_data.items()
-                for mz, intensity in sorted(level.items(), key=lambda x: x[1], reverse=True)[:10]  # TODO: check top peaks effect
+                for mz, intensity in sorted(level.items(), key=lambda x: x[1], reverse=True)[:10]
             ]
             spectra_data = sorted(spectra_data, key=lambda x: x[0], reverse=True)
             return " ".join(whole_seq), spectra_data
