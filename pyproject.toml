@@ -15,7 +15,9 @@ dependencies = [
     "seaborn>=0.13.2",
     "orjson>=3.13.0",
     "scikit-learn>=1.8.0",
-    "envipath-python"
+    "envipath-python",
+    "h5py",
+    "tensorboard>=2.21.0",
 ]
 
 [tool.uv.sources]

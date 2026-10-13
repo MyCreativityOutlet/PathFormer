@@ -28,6 +28,8 @@ from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
 from statistics import mean
+
+import h5py
 import networkx as nx
 import numpy as np
 import orjson
@@ -298,8 +300,6 @@ def update_beams_pathformer_flat(step, model, decode_func, flat_tokens, flat_pad
 def beam_decode_pathformer(model, prefix, idx0_pos, num_beams=5, spectra=None):
     """Prefix-aware beam decoding with KV Caching."""
     if model.__class__.__name__ == "PathFormer":
-        decode_func = partial(model.forward, test=True, spectra=spectra)
-    elif model.__class__.__name__ == "BinnedPathFormer":
         # The MZ encoder runs exactly once prior to decoding
         z, src_mask = model.encode(spectra)
         decode_func = partial(model.decode, mz_enc_out=z, mz_mask=src_mask, test=True)
@@ -358,13 +358,10 @@ def beam_decode_pathformer(model, prefix, idx0_pos, num_beams=5, spectra=None):
             flat_cache[k] = v  # Catch-all for ints, bools, etc.
 
     # Expand the encoder memory and update decode_func for the flat phase
-    if model.__class__.__name__ == "BinnedPathFormer":
+    if model.__class__.__name__ == "PathFormer":
         flat_z = z.repeat_interleave(num_beams, dim=0)
         flat_src_mask = src_mask.repeat_interleave(num_beams, dim=0)
         decode_func = partial(model.decode, mz_enc_out=flat_z, mz_mask=flat_src_mask, test=True)
-    elif model.__class__.__name__ == "PathFormer":
-        flat_spectra = spectra.repeat_interleave(num_beams, dim=0) if spectra is not None else None
-        decode_func = partial(model.forward, test=True, spectra=flat_spectra)
 
     # Insert the initial branched tokens into the flattened tensors
     insert_pos = (idx0_pos + 1).repeat_interleave(num_beams)
@@ -1403,3 +1400,275 @@ def pathformer_split_disjoint(args, force_re_split=False):
     _write_split_table(db_conn, splits, split_method)
     db_conn.close()
     return
+
+
+def get_raw_envipath(package_name: str) -> dict:
+    with open(f"data/envipath/{package_name}.json") as d_file:
+        data = json.load(d_file)
+    return data
+
+
+def standardise_pathways(pathways, canon_func):
+    for pathway in tqdm(pathways, desc="Fixing pathway edges and canonicalising SMILES"):
+        edges_list = pathway["links"]
+        nodes_list = pathway["nodes"]
+        source_changes = {}
+        target_changes = {}
+        for i, edge in enumerate(edges_list):
+            source = nodes_list[edge["source"]]
+            source_i = edge["source"]
+            target = nodes_list[edge["target"]]
+            target_i = edge["target"]
+            while source["depth"] == -1:
+                for edge2 in edges_list:
+                    if nodes_list[edge2["target"]] == source:
+                        source = nodes_list[edge2["source"]]
+                        source_i = edge2["source"]
+                        break
+            while target["depth"] == -1:
+                for edge2 in edges_list:
+                    if nodes_list[edge2["source"]] == target:
+                        target = nodes_list[edge2["target"]]
+                        target_i = edge2["target"]
+                        break
+            if edge["source"] != source_i:
+                source_changes[i] = source_i
+            if edge["target"] != target_i:
+                target_changes[i] = target_i
+        for i in source_changes:
+            edges_list[i]["source"] = source_changes[i]
+        for i in target_changes:
+            edges_list[i]["target"] = target_changes[i]
+        to_remove = []
+        for i, edge in enumerate(edges_list):
+            for j, edge2 in enumerate(edges_list):
+                if i != j and i not in to_remove and j not in to_remove and edge["source"] == edge2["source"] and edge["target"] == edge2["target"]:
+                    to_remove.append(j)
+        to_remove = sorted(to_remove, reverse=True)
+        for i in to_remove:
+            del edges_list[i]
+        for node in pathway["nodes"]:
+            if "smiles" in node:
+                node["smiles"] = canon_func(node["smiles"], allow_none=False)
+
+    return pathways
+
+
+def get_metals():
+    return {"Mg", "Na", "Al", "K", "Ca", "Zn", "Hg", "As", "Sn", "U", "Se", "Tc", "Os", "Fe", "Li", "Pd", "Pt", "Mn",
+            "Ni", "Cd", "Cu", "Cs", "Rh", "Ba", "Zr", "Ag", "Ti", "Au", "Ru", "Co"}
+
+
+def ep_pathways_to_nx(pathways, save_path=None, ignore_metals=True):
+    co2 = {"O=C=O", "C(=O)=O"}
+    metals = get_metals()
+
+    def remove_metals(smiles):
+        s_parts = smiles.split(".")
+        new_parts = []
+        for part in s_parts:
+            if any(m in part for m in metals):
+                continue
+            new_parts.append(part)
+        return ".".join(new_parts)
+
+    db_conn = None
+    if save_path is not None:
+        db_conn = sqlite3.connect(save_path)
+        db_conn.execute("""
+                        CREATE TABLE IF NOT EXISTS pathways
+                        (
+                            id
+                            INTEGER
+                            PRIMARY
+                            KEY
+                            AUTOINCREMENT,
+                            root_smiles
+                            TEXT,
+                            graph_json
+                            TEXT
+                            NOT
+                            NULL
+                        )
+        """)
+        db_conn.commit()
+
+    with open("data/all_uncharged_maps.json") as file:
+        uncharged_map = json.load(file)
+    spectra_file = h5py.File("data/cfmid_spectra.h5", "r")
+    smiles_to_i = {s: i for i, s in enumerate(spectra_file["compound"]["smiles"])}
+    smiles_to_i = {k.decode(): v for k, v in smiles_to_i.items()}
+    inserted_graphs = 0
+    canon_fails = 0
+    empty_graphs = 0
+    many_components = 0
+    no_root = 0
+    many_root = 0
+    single_node = 0
+    name_count = 0
+    depths = []
+    sizes = []
+    no_spectra = []
+    for pathway in tqdm(pathways):
+        nodes = pathway["nodes"]
+        if len(nodes) <= 1:
+            single_node += 1
+            continue
+        fail_canon = False
+        for node in nodes:
+            if "smiles" not in node and node["depth"] == -1:
+                continue
+            canon_smiles = canon_smile_rdkit(node["smiles"], remove_stereochemistry=True)
+            if canon_smiles is None:
+                fail_canon = True
+                break
+            node["smiles"] = canon_smiles
+        if fail_canon:
+            canon_fails += 1
+            continue
+        root = None
+        if pathway.get("pathwayName") is not None:
+            root = [n for n in nodes if n.get("name") == pathway.get("pathwayName")]
+            if len(root) == 0:
+                root = None
+        if root is None:
+            root = [n for n in nodes if n.get("root", n["depth"] == 0)]
+        if len(root) == 0:
+            no_root += 1
+            continue
+        if len(root) > 1:
+            many_root += 1
+            continue
+        root_depth = root[0]["depth"]
+        root_smiles = root[0]["smiles"].split(".")
+        if len(root_smiles) > 1:
+            many_root += 1
+            continue
+        root_smiles = root_smiles[0]
+        if ignore_metals:
+            root_smiles = remove_metals(root_smiles)
+        graph = nx.DiGraph()
+        for edge in pathway["links"]:
+            source = nodes[edge["source"]]
+            target = nodes[edge["target"]]
+            if source["smiles"] in co2 or target["smiles"] in co2:
+                continue
+            if ignore_metals:
+                source["smiles"] = remove_metals(source["smiles"])
+                target["smiles"] = remove_metals(target["smiles"])
+            if source["smiles"] != root_smiles and (source["depth"] <= root_depth or target["depth"] <= root_depth):
+                continue
+            sources = set()
+            if source["smiles"]:
+                for smiles in source["smiles"].split("."):
+                    if smiles not in graph:
+                        spectra_data = extract_spectra_data(smiles, uncharged_map, spectra_file, smiles_to_i)
+                        if spectra_data is None:
+                            no_spectra.append(smiles)
+                        graph.add_node(smiles, depth=source["depth"] - root_depth,
+                                       root=smiles == root_smiles, spectra=spectra_data)
+                    sources.add(smiles)
+            # Source must be added for target to be added
+            targets = set()
+            if target["smiles"] and source["smiles"]:
+                for smiles in target["smiles"].split("."):
+                    if smiles not in graph:
+                        spectra_data = extract_spectra_data(smiles, uncharged_map, spectra_file, smiles_to_i)
+                        if spectra_data is None:
+                            no_spectra.append(smiles)
+                        graph.add_node(smiles, depth=target["depth"] - root_depth, root=smiles == root_smiles,
+                                       spectra=spectra_data)
+                    targets.add(smiles)
+            # Both source and target must exist to add an edge
+            for source_smiles in sources:
+                for target_smiles in targets:
+                    if "ecNumbers" in edge and len(edge["ecNumbers"]) > 0:
+                        ec_num = edge["ecNumbers"][0]["ecNumber"]
+                        ec_num = ".".join(ec_num.split(".")[:3])
+                        graph.add_edge(source_smiles, target_smiles, ec_num=ec_num)
+                    else:
+                        graph.add_edge(source_smiles, target_smiles)
+        components = [c for c in sorted(nx.weakly_connected_components(graph), key=len, reverse=True) if
+                      root_smiles in c]
+        if len(components) > 1:
+            many_components += 1
+        elif len(components) == 0:
+            empty_graphs += 1
+            continue
+        graph = nx.subgraph(graph, components[0])
+        if len(graph.nodes) <= 1:
+            single_node += 1
+            continue
+        if pathway.get("pathwayName") is not None:
+            graph.graph["name"] = pathway.get("pathwayName")
+            name_count += 1
+        assert any(r for _, r in graph.nodes("root"))
+        if db_conn is not None:
+            db_conn.execute("""
+                            INSERT INTO pathways (root_smiles,
+                                                  graph_json)
+                            VALUES (?, ?)
+            """, (
+                                root_smiles,
+                                orjson.dumps(nx.node_link_data(graph)),
+                            ))
+            inserted_graphs += 1
+            if inserted_graphs % 1000 == 0:
+                db_conn.commit()
+        sizes.append(len(graph.nodes))
+        depths.append(max([n[1] for n in graph.nodes("depth")]))
+    print(f"Depths info:\n{pd.Series(depths).describe(percentiles=[0.8, 0.9, 0.95, 0.99])}")
+    print(f"Sizes info:\n{pd.Series(sizes).describe(percentiles=[0.8, 0.9, 0.95, 0.99])}")
+    print(f"No spectra:\n{len(no_spectra)} out of {sum(sizes)} compounds")
+    if canon_fails > 0:
+        print(f"Ignored {canon_fails} pathways with canonicalisation issues")
+    if empty_graphs > 0:
+        print(f"Ignored {empty_graphs} pathways with zero nodes")
+    if single_node > 0:
+        print(f"Ignored {single_node} pathways with only one node")
+    if many_root > 0:
+        print(f"Ignored {many_root} pathways with more than one root node")
+    if no_root > 0:
+        print(f"Ignored {no_root} pathways with no root node")
+    if many_components > 0:
+        print(f"There were {many_components} pathways with multiple weakly connected components, took the largest")
+    if name_count != 0:
+        print(f"Attached name to {name_count} out of {len(sizes)} pathways")
+    if db_conn is not None:
+        db_conn.commit()
+        db_conn.close()
+    return depths, sizes
+
+
+def extract_spectra_data(smiles, uncharged_map, hdf5_file, smiles_to_i):
+    try:
+        spectra_data = {"energies": defaultdict(dict), "structs": {}}
+        smiles_index = smiles_to_i[uncharged_map[smiles]]
+        spectra_data["structs"]["frag_struct"] = [s.decode() for s in hdf5_file["annotation"]["frag_struct"][
+            smiles_to_i[uncharged_map[smiles]]]]
+        spectra_data["structs"]["frag_mz"] = hdf5_file["annotation"]["frag_mz"][
+            smiles_to_i[uncharged_map[smiles]]].tolist()
+        spectra_data["structs"]["frag_id"] = hdf5_file["annotation"]["frag_id"][
+            smiles_to_i[uncharged_map[smiles]]].tolist()
+        for energy_key in hdf5_file["spectra"]:
+            for data_key in hdf5_file["spectra"][energy_key]:
+                spectra_data["energies"][energy_key][data_key] = hdf5_file["spectra"][energy_key][data_key][
+                    smiles_index].tolist()
+        return spectra_data
+    except KeyError:
+        return None
+
+
+def preprocess_from_ep():
+    soil = standardise_pathways(get_raw_envipath("soil")["pathways"], canon_smile_rdkit)
+    bbd = standardise_pathways(get_raw_envipath("bbd")["pathways"], canon_smile_rdkit)
+    sludge = standardise_pathways(get_raw_envipath("sludge")["pathways"], canon_smile_rdkit)
+    sediment = standardise_pathways(get_raw_envipath("sediment")["pathways"], canon_smile_rdkit)
+    envipath = soil + sludge + bbd + sediment
+    names = ["envipath", "soil", "bbd", "sludge", "sediment"]
+    datasets = [envipath, soil, bbd, sludge, sediment]
+    ignore_metals = True
+    for name, dataset in zip(names, datasets):
+        print(f"Processing {name}")
+        save_name = f"{name}_no_metal" if ignore_metals else name
+        ep_pathways_to_nx(dataset, f"data/{save_name}_nx_pathways.sqlite", ignore_metals=ignore_metals)

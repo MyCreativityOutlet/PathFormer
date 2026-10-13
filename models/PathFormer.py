@@ -48,7 +48,7 @@ class PathFormer(BaseModel):
             else:
                 raise ValueError(f"Unknown model size {size}")
         self.model_config: dict = config
-        self.save_path: str = kwargs.get("save_path", f"results/BinnedPathFormer/{get_pathformer_version(args, config)}")
+        self.save_path: str = kwargs.get("save_path", f"results/PathFormer/{get_pathformer_version(args, config)}")
         os.makedirs(self.save_path, exist_ok=True)
         if config.get("seq_method", "bfs") == "bfs":
             self.seq_method = pathway_graph_to_seq_bfs

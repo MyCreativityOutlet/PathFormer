@@ -23,6 +23,8 @@ import json
 import os
 from tqdm import tqdm
 
+from utils.utils import preprocess_from_ep
+
 
 def download_envipath(save_path, force_download=False):
     host = 'https://envipath.org/'
@@ -30,7 +32,7 @@ def download_envipath(save_path, force_download=False):
     soil_package = f'{host}package/5882df9c-dae1-4d80-a40e-db4724271456'
     sludge_package = f'{host}package/521c547a-fd2a-491c-ad5b-7eaa1577fb65'
     sediment_package = f'{host}package/f05e38d8-e9b4-4c3e-b0d8-9ab29966eccf'
-    with open("ep_login") as l_file:
+    with open("ep_login.txt") as l_file:
         file = l_file.readline().strip()
     username, password = file.split(" ")
     eP = enviPath('https://envipath.org/api/legacy', new_api=True)
@@ -102,3 +104,4 @@ def download_raw():
 
 if __name__ == "__main__":
     check_envipath_data()
+    preprocess_from_ep()
